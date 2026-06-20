@@ -1,0 +1,565 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# YOLOv8n Fine-Tuning \u2014 Poultry Detection (Live / Dead / Egg)\n",
+    "\n",
+    "This notebook trains a **real** YOLOv8n model on poultry imagery and produces\n",
+    "genuine training curves, a genuine confusion matrix, and genuine per-class\n",
+    "metrics \u2014 the actual artefacts that Chapter 5 (\u00a75.4) of the project report\n",
+    "describes.\n",
+    "\n",
+    "**Before you run this:** read the dataset section below. There is no single\n",
+    "public dataset that already has all three classes (`live`, `dead`, `egg`)\n",
+    "together, so you will assemble one from two or three public Roboflow\n",
+    "datasets, or from your own farm photos, or a mix of both.\n",
+    "\n",
+    "**What you will have at the end:**\n",
+    "- `runs/detect/poultry_yolov8n/results.png` \u2014 the real loss/precision/recall/mAP curves (\u2192 Figure 5.1)\n",
+    "- `runs/detect/poultry_yolov8n/confusion_matrix.png` \u2014 the real confusion matrix (\u2192 Figure 5.2)\n",
+    "- A folder of real annotated predictions on test images (\u2192 Figure 5.3)\n",
+    "- `results.csv`, `args.yaml`, and `weights/best.pt` \u2014 the files you push to\n",
+    "  GitHub so the repository-link sentence in Chapter 5 is finally true.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 0 \u2014 Get a dataset\n",
+    "\n",
+    "You need a folder structured like this (standard YOLO format):\n",
+    "\n",
+    "```\n",
+    "poultry_dataset/\n",
+    "  data.yaml\n",
+    "  train/images/*.jpg   train/labels/*.txt\n",
+    "  val/images/*.jpg      val/labels/*.txt\n",
+    "  test/images/*.jpg     test/labels/*.txt\n",
+    "```\n",
+    "\n",
+    "Each `.txt` label file has one line per object:\n",
+    "`class_id x_center y_center width height` (all four numbers normalised 0\u20131).\n",
+    "Use class ids `0 = live`, `1 = dead`, `2 = egg` to match Chapter 1's\n",
+    "definition table and Chapter 5's class ordering.\n",
+    "\n",
+    "### Where to actually get images with usable annotations\n",
+    "\n",
+    "No single dataset covers all three classes, so combine 2\u20133 of the following.\n",
+    "**Roboflow lets you fork multiple public datasets into one workspace project\n",
+    "and merge/relabel their classes for free** \u2014 search, fork, then export.\n",
+    "\n",
+    "| Need | Real dataset to fork on Roboflow Universe |\n",
+    "|---|---|\n",
+    "| Live chickens | `https://universe.roboflow.com/chickens/chicken-detection-and-tracking` |\n",
+    "| Live / broiler chickens (larger set) | `https://universe.roboflow.com/innodatatics-cjikw/broiler-chicken-detection` |\n",
+    "| Healthy vs sick broilers (has a usable \"unhealthy\" class you can remap toward `dead`) | `https://universe.roboflow.com/technicalresearch/broiler-chicken-healthy-and-sick` |\n",
+    "| Browse more broiler/chicken sets | `https://universe.roboflow.com/search?q=class:broiler` and `https://universe.roboflow.com/search?q=class:chicken` |\n",
+    "| Eggs | `https://universe.roboflow.com/sksu/egg-detection-ud1ys` or `https://universe.roboflow.com/sliit-xsolh/chicken-embryo-egg-detection` |\n",
+    "\n",
+    "There is **no usable public \"dead chicken\" dataset of real size** \u2014 the only\n",
+    "one indexed publicly has 2 images, which is not enough to train on. Realistic\n",
+    "options for the `dead` class:\n",
+    "1. Take your own farm photos of naturally deceased birds (you mentioned you\n",
+    "   visited real farms \u2014 even 30\u201350 images, each rotated/flipped a few times\n",
+    "   during augmentation, is workable for a small project).\n",
+    "2. Stage a small number of photos: a bird lying on its side on a barn floor\n",
+    "   is visually distinct enough for YOLO to learn the pattern even from a\n",
+    "   modest sample.\n",
+    "3. Be upfront in the report that the `dead` class has the smallest sample \u2014\n",
+    "   this is realistic and matches what the published literature reports too\n",
+    "   (Subedi et al., 2025; Ufitikirezi et al., 2024 both flag this as the hard\n",
+    "   class).\n",
+    "\n",
+    "### Option A \u2014 Download directly from Roboflow (recommended)\n",
+    "Create a free Roboflow account, fork/merge the datasets above into one\n",
+    "project, remap classes to `live` / `dead` / `egg`, generate a version, then\n",
+    "copy the \"Export \u2192 YOLOv8\" code snippet Roboflow gives you (it includes your\n",
+    "own API key) and paste it into the cell below, replacing the placeholder.\n",
+    "\n",
+    "### Option B \u2014 Upload a zip you assembled yourself\n",
+    "If you already labelled images with `labelImg` or Roboflow's annotation tool\n",
+    "and exported a YOLOv8-format zip, skip Option A and use the upload cell\n",
+    "instead.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 1 \u2014 Check the GPU and install dependencies"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!nvidia-smi\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!pip install -q ultralytics==8.3.* roboflow\n",
+    "import ultralytics\n",
+    "ultralytics.checks()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 2 \u2014 Get the dataset onto the Colab machine\n",
+    "\n",
+    "Run **either** the Option A cell **or** the Option B cell below, not both.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# ---- OPTION A: download from Roboflow ----\n",
+    "# Replace this whole cell with the exact snippet Roboflow gives you after\n",
+    "# you export your merged project. It will look like this:\n",
+    "#\n",
+    "# from roboflow import Roboflow\n",
+    "# rf = Roboflow(api_key=\"YOUR_API_KEY\")\n",
+    "# project = rf.workspace(\"your-workspace\").project(\"your-project-name\")\n",
+    "# version = project.version(1)\n",
+    "# dataset = version.download(\"yolov8\")\n",
+    "# DATASET_DIR = dataset.location\n",
+    "#\n",
+    "# Uncomment and edit the lines above with your own values, then run this cell.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# ---- OPTION B: upload a zip you assembled yourself ----\n",
+    "from google.colab import files\n",
+    "import zipfile, os\n",
+    "\n",
+    "uploaded = files.upload()  # choose your poultry_dataset.zip\n",
+    "zip_name = list(uploaded.keys())[0]\n",
+    "\n",
+    "with zipfile.ZipFile(zip_name, 'r') as z:\n",
+    "    z.extractall('poultry_dataset')\n",
+    "\n",
+    "DATASET_DIR = os.path.abspath('poultry_dataset')\n",
+    "print(\"Dataset extracted to:\", DATASET_DIR)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 3 \u2014 Verify the dataset and class balance\n",
+    "\n",
+    "This reproduces a real version of Table 3.2 from Chapter 3 \u2014 actual box\n",
+    "counts per class and per split, not the placeholder numbers.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import os, glob\n",
+    "from collections import Counter\n",
+    "\n",
+    "CLASS_NAMES = {0: \"live\", 1: \"dead\", 2: \"egg\"}\n",
+    "\n",
+    "def count_split(split_dir):\n",
+    "    label_files = glob.glob(os.path.join(split_dir, \"labels\", \"*.txt\"))\n",
+    "    counts = Counter()\n",
+    "    n_images = len(glob.glob(os.path.join(split_dir, \"images\", \"*\")))\n",
+    "    for lf in label_files:\n",
+    "        with open(lf) as f:\n",
+    "            for line in f:\n",
+    "                line = line.strip()\n",
+    "                if not line:\n",
+    "                    continue\n",
+    "                cls_id = int(line.split()[0])\n",
+    "                counts[CLASS_NAMES.get(cls_id, cls_id)] += 1\n",
+    "    return n_images, counts\n",
+    "\n",
+    "print(f\"{'Split':<10}{'Images':<10}{'live':<8}{'dead':<8}{'egg':<8}\")\n",
+    "for split in [\"train\", \"val\", \"test\"]:\n",
+    "    split_path = os.path.join(DATASET_DIR, split)\n",
+    "    if not os.path.isdir(split_path):\n",
+    "        print(f\"  (no '{split}' folder found at {split_path} \u2014 check your dataset structure)\")\n",
+    "        continue\n",
+    "    n_img, counts = count_split(split_path)\n",
+    "    print(f\"{split:<10}{n_img:<10}{counts.get('live',0):<8}{counts.get('dead',0):<8}{counts.get('egg',0):<8}\")\n",
+    "\n",
+    "print()\n",
+    "print(\"Copy this real table into Table 3.2 of Chapter 3, replacing the placeholder numbers.\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 4 (optional) \u2014 Oversample the `dead` class\n",
+    "\n",
+    "Ultralytics' YOLOv8 trainer does not expose a simple per-class loss-weight\n",
+    "argument the way Chapter 5's Table 5.2 currently describes (\"class loss\n",
+    "weight 3.0 for dead\"). The practical, honest way to fight class imbalance is\n",
+    "**oversampling**: duplicate images that contain a `dead` box a few times in\n",
+    "the training split so the model sees them more often per epoch.\n",
+    "\n",
+    "If you do this, update Table 5.2 in Chapter 5 to say \"stratified oversampling\n",
+    "of the dead class (\u00d7N duplication)\" instead of \"class loss weight 3.0/1.0\" \u2014\n",
+    "say what you actually did.\n",
+    "\n",
+    "Skip this cell if your `dead` class already has a reasonable number of images\n",
+    "relative to `live`.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import shutil, os, glob\n",
+    "\n",
+    "OVERSAMPLE_FACTOR = 3  # duplicate each dead-containing image this many extra times\n",
+    "\n",
+    "train_img_dir = os.path.join(DATASET_DIR, \"train\", \"images\")\n",
+    "train_lbl_dir = os.path.join(DATASET_DIR, \"train\", \"labels\")\n",
+    "\n",
+    "dead_label_files = []\n",
+    "for lf in glob.glob(os.path.join(train_lbl_dir, \"*.txt\")):\n",
+    "    with open(lf) as f:\n",
+    "        if any(line.strip().startswith(\"1 \") for line in f):\n",
+    "            dead_label_files.append(lf)\n",
+    "\n",
+    "print(f\"Found {len(dead_label_files)} training images containing a 'dead' box.\")\n",
+    "\n",
+    "for lf in dead_label_files:\n",
+    "    base = os.path.splitext(os.path.basename(lf))[0]\n",
+    "    img_candidates = glob.glob(os.path.join(train_img_dir, base + \".*\"))\n",
+    "    if not img_candidates:\n",
+    "        continue\n",
+    "    img_path = img_candidates[0]\n",
+    "    ext = os.path.splitext(img_path)[1]\n",
+    "    for i in range(OVERSAMPLE_FACTOR):\n",
+    "        new_base = f\"{base}_dup{i}\"\n",
+    "        shutil.copy(img_path, os.path.join(train_img_dir, new_base + ext))\n",
+    "        shutil.copy(lf, os.path.join(train_lbl_dir, new_base + \".txt\"))\n",
+    "\n",
+    "print(\"Oversampling complete. Re-run the Step 3 cell to see the updated class balance.\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 5 \u2014 Write `data.yaml` (skip if Roboflow already gave you one)\n",
+    "\n",
+    "If you used Option A (Roboflow download), a `data.yaml` already exists in\n",
+    "`DATASET_DIR` \u2014 just point `DATA_YAML` at it. If you used Option B and built\n",
+    "the folders yourself, run the cell below to generate one.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "\n",
+    "DATA_YAML = os.path.join(DATASET_DIR, \"data.yaml\")\n",
+    "\n",
+    "if not os.path.exists(DATA_YAML):\n",
+    "    yaml_content = f'''path: {DATASET_DIR}\n",
+    "train: train/images\n",
+    "val: val/images\n",
+    "test: test/images\n",
+    "\n",
+    "names:\n",
+    "  0: live\n",
+    "  1: dead\n",
+    "  2: egg\n",
+    "'''\n",
+    "    with open(DATA_YAML, \"w\") as f:\n",
+    "        f.write(yaml_content)\n",
+    "    print(\"Wrote new data.yaml:\")\n",
+    "else:\n",
+    "    print(\"Using existing data.yaml from your dataset:\")\n",
+    "\n",
+    "print(open(DATA_YAML).read())\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 6 \u2014 Train YOLOv8n\n",
+    "\n",
+    "These hyperparameters match Table 5.2 in Chapter 5 as closely as the\n",
+    "Ultralytics API allows (epochs, batch size, image size, optimiser, learning\n",
+    "rate). If you change any value here, **update Table 5.2 to match what you\n",
+    "actually ran** \u2014 the table must describe the real run, not a plan.\n",
+    "\n",
+    "A 100-epoch run on a free Colab T4 GPU takes roughly 1\u20135 hours depending on\n",
+    "dataset size. If you are short on time, drop `epochs` to 50 and say so in\n",
+    "the report.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "from ultralytics import YOLO\n",
+    "\n",
+    "model = YOLO(\"yolov8n.pt\")  # COCO-pretrained starting point (transfer learning)\n",
+    "\n",
+    "results = model.train(\n",
+    "    data=DATA_YAML,\n",
+    "    epochs=100,          # reduce to 50 if you are short on time \u2014 then update Table 5.2\n",
+    "    batch=16,\n",
+    "    imgsz=640,\n",
+    "    optimizer=\"SGD\",\n",
+    "    momentum=0.937,\n",
+    "    weight_decay=0.0005,\n",
+    "    lr0=0.0008,\n",
+    "    patience=20,\n",
+    "    name=\"poultry_yolov8n\",\n",
+    "    project=\"runs/detect\",\n",
+    "    plots=True,           # tells Ultralytics to save results.png, confusion_matrix.png, etc.\n",
+    ")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 7 \u2014 Look at the real training curves (\u2192 Figure 5.1)\n",
+    "\n",
+    "Ultralytics automatically saves a curves figure and individual per-class\n",
+    "curve plots in the run folder. Display the all-in-one figure first.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "from IPython.display import Image, display\n",
+    "import glob\n",
+    "\n",
+    "run_dir = glob.glob(\"runs/detect/poultry_yolov8n*\")[-1]\n",
+    "print(\"Run folder:\", run_dir)\n",
+    "\n",
+    "display(Image(filename=f\"{run_dir}/results.png\"))\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Ultralytics also saves these individual curve images in the run folder \u2014\n",
+    "# these map onto the panels described in Chapter 5 (\u00a75.4.3):\n",
+    "for fname in [\"BoxP_curve.png\", \"BoxR_curve.png\", \"BoxF1_curve.png\", \"BoxPR_curve.png\"]:\n",
+    "    path = f\"{run_dir}/{fname}\"\n",
+    "    import os\n",
+    "    if os.path.exists(path):\n",
+    "        print(fname)\n",
+    "        display(Image(filename=path))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 8 \u2014 Validate on the held-out test set (\u2192 Table 5.3)\n",
+    "\n",
+    "This produces the **real** precision, recall, F1, and mAP numbers per class.\n",
+    "Copy these into Table 5.3 of Chapter 5, replacing the placeholder figures \u2014\n",
+    "your real numbers will likely differ from what is currently written there,\n",
+    "and that is fine. Report what you actually got.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "metrics = model.val(data=DATA_YAML, split=\"test\")\n",
+    "\n",
+    "print(\"\\n--- Per-class results (copy these into Table 5.3) ---\")\n",
+    "names = metrics.names\n",
+    "p, r, f1 = metrics.box.p, metrics.box.r, metrics.box.f1\n",
+    "ap50 = metrics.box.ap50\n",
+    "for i, name in names.items():\n",
+    "    print(f\"{name:<8} precision={p[i]:.3f}  recall={r[i]:.3f}  F1={f1[i]:.3f}  AP@0.5={ap50[i]:.3f}\")\n",
+    "\n",
+    "print(f\"\\nmAP@0.5 (all classes):      {metrics.box.map50:.3f}\")\n",
+    "print(f\"mAP@0.5:0.95 (all classes): {metrics.box.map:.3f}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 9 \u2014 Confusion matrix (\u2192 Figure 5.2)\n",
+    "\n",
+    "Already generated by the validation step above and saved to the run/val\n",
+    "folder.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import glob\n",
+    "from IPython.display import Image, display\n",
+    "\n",
+    "val_dirs = sorted(glob.glob(\"runs/detect/val*\"))\n",
+    "val_dir = val_dirs[-1]\n",
+    "print(\"Validation folder:\", val_dir)\n",
+    "display(Image(filename=f\"{val_dir}/confusion_matrix.png\"))\n",
+    "display(Image(filename=f\"{val_dir}/confusion_matrix_normalized.png\"))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 10 \u2014 Sample annotated predictions (\u2192 Figure 5.3)\n",
+    "\n",
+    "Runs the trained model on a handful of test images and saves the real\n",
+    "bounding-box overlays \u2014 replace the synthetic mockup figure in the report\n",
+    "with a grid built from a few of these.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import glob, os\n",
+    "\n",
+    "test_images = glob.glob(os.path.join(DATASET_DIR, \"test\", \"images\", \"*\"))[:6]\n",
+    "print(f\"Running inference on {len(test_images)} test images...\")\n",
+    "\n",
+    "pred_results = model.predict(\n",
+    "    source=test_images,\n",
+    "    save=True,\n",
+    "    conf=0.35,\n",
+    "    project=\"runs/detect\",\n",
+    "    name=\"poultry_predictions\",\n",
+    ")\n",
+    "\n",
+    "pred_dir = sorted(glob.glob(\"runs/detect/poultry_predictions*\"))[-1]\n",
+    "print(\"Annotated predictions saved to:\", pred_dir)\n",
+    "\n",
+    "from IPython.display import Image, display\n",
+    "for img_path in sorted(glob.glob(f\"{pred_dir}/*\"))[:6]:\n",
+    "    display(Image(filename=img_path))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Step 11 \u2014 Package everything for your repository\n",
+    "\n",
+    "This zips the run folder (weights, results.csv, args.yaml, all curve images,\n",
+    "confusion matrix, sample predictions) so you can push it to a real GitHub\n",
+    "repository and the link in Chapter 5 points at something genuine.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import shutil\n",
+    "\n",
+    "shutil.make_archive(\"poultry_yolov8n_run\", \"zip\", run_dir)\n",
+    "print(\"Created poultry_yolov8n_run.zip \u2014 download it from the Colab file browser on the left.\")\n",
+    "\n",
+    "from google.colab import files\n",
+    "files.download(\"poultry_yolov8n_run.zip\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Pushing to GitHub (do this on your own machine after downloading the zip)\n",
+    "\n",
+    "```bash\n",
+    "git init poultry-yolov8-training\n",
+    "cd poultry-yolov8-training\n",
+    "unzip ../poultry_yolov8n_run.zip -d .\n",
+    "git add .\n",
+    "git commit -m \"YOLOv8n fine-tuning run: live/dead/egg poultry detection\"\n",
+    "git branch -M main\n",
+    "git remote add origin https://github.com/<your-username>/<your-repo-name>.git\n",
+    "git push -u origin main\n",
+    "```\n",
+    "\n",
+    "Once pushed, put the real `https://github.com/<your-username>/<your-repo-name>`\n",
+    "URL into the sentence in Chapter 5 that currently says\n",
+    "`[insert repository link]`.\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Final checklist before you put this back into the Word document\n",
+    "\n",
+    "- [ ] Table 3.2 (Chapter 3) \u2014 replace placeholder image/box counts with the real numbers from Step 3\n",
+    "- [ ] Table 5.2 (Chapter 5) \u2014 make sure every hyperparameter listed matches what you actually passed to `model.train()`; if you used oversampling instead of per-class loss weighting, say so\n",
+    "- [ ] Figure 5.1 \u2014 replace with `results.png` (and/or the individual curve images) from Step 7\n",
+    "- [ ] Figure 5.2 \u2014 replace with `confusion_matrix.png` from Step 9\n",
+    "- [ ] Figure 5.3 \u2014 replace with a grid of real annotated predictions from Step 10\n",
+    "- [ ] Table 5.3 \u2014 replace placeholder precision/recall/F1/mAP with the real numbers from Step 8\n",
+    "- [ ] The sentence about \"results.csv, args.yaml, and trained model weights are available in the project repository at [insert repository link]\" \u2014 fill in your real GitHub URL from Step 11, **only after you have actually pushed the files**\n",
+    "- [ ] \u00a76.2 (Limitations) \u2014 if your real numbers are notably lower than the placeholder ones (likely, given dataset size), say so honestly; a small, honestly-reported result is far stronger than an inflated one\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "colab": {
+   "provenance": [],
+   "gpuType": "T4"
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  },
+  "accelerator": "GPU"
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
